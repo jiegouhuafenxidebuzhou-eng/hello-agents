@@ -1,10 +1,13 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 import os
+import logging
 from pathlib import Path
 
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 # 明确指向脚本所在目录下的 .env，避免工作目录不同导致加载失败
 load_dotenv(Path(__file__).parent / ".env")
@@ -67,5 +70,22 @@ class HelloAgentsLLM:
             return response.choices[0].message
         except Exception as e:
             print(f"❌ 调用LLM API时发生错误: {e}")
+            return None
+
+    def complete(self, messages: List[Dict[str, str]],
+                 temperature: float = 0) -> Optional[str]:
+        """非流式、静默调用，返回完整文本；失败返回 None（不打印到 stdout）。
+
+        供记忆系统等不需要流式输出的内部任务使用（如语义记忆的三元组抽取），
+        避免流式输出污染调用方 stdout、且 None 返回值由调用方自行兜底。
+        """
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model, messages=messages,
+                temperature=temperature, stream=False,
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            logger.warning(f"LLM complete 调用失败: {e}")
             return None
 

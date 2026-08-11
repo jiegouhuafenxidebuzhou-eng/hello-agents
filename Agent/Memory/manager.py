@@ -6,8 +6,8 @@
 - forget(memory_id) -> bool
 - stats() -> dict
 
-目前已接入工作记忆和情景记忆；语义记忆后端留作插口（为 None 表示未启用），
-后续实现同接口即可直接挂上，MemoryTool 无需改动。
+已接入工作记忆、情景记忆、语义记忆三类后端；语义记忆默认关闭，
+enable_semantic=True 时按本会话身份构造（图谱/LLM 按 env/参数自动降级）。
 """
 
 from typing import Any, Dict, List, Optional
@@ -24,7 +24,11 @@ class MemoryManager:
                  user_id: str = "default",
                  session_id: str = "default",
                  enable_episodic: bool = False,
-                 episodic_db_path: Optional[str] = None):
+                 episodic_db_path: Optional[str] = None,
+                 enable_semantic: bool = False,
+                 semantic_db_path: Optional[str] = None,
+                 enable_graph: bool = True,
+                 enable_llm: bool = False):
         self.user_id = user_id
         self.session_id = session_id
         # 未显式提供 working 时，按本会话身份构造一个
@@ -35,10 +39,27 @@ class MemoryManager:
             from Agent.Memory.episodic import EpisodicMemory
             episodic = EpisodicMemory(user_id=user_id, session_id=session_id,
                                      db_path=episodic_db_path)
+        # 未显式提供 semantic 但显式开启时，按本会话身份构造一个
+        if semantic is None and enable_semantic:
+            from Agent.Memory.semantic import SemanticMemory
+            llm_client = None
+            if enable_llm:
+                try:
+                    from Agent.LLMClient.llm_client import HelloAgentsLLM
+                    llm_client = HelloAgentsLLM()  # 读 .env；未配置抛 ValueError
+                except Exception as e:
+                    # graceful：未配 LLM 不阻断语义记忆，仅关掉 LLM 三元组抽取（回退规则）
+                    print(f"[semantic] LLM 客户端未启用: {e}")
+                    llm_client = None
+            # db_path 默认复用 episodic_db_path（共享 SQLite 单例 + memory_type 分区）
+            sem_db = semantic_db_path or episodic_db_path
+            semantic = SemanticMemory(user_id=user_id, session_id=session_id,
+                                      db_path=sem_db, enable_graph=enable_graph,
+                                      llm_client=llm_client)
         self.backends: Dict[str, Any] = {
             "working": working,
             "episodic": episodic,      # 默认 None 占位；enable_episodic=True 时自动构造
-            "semantic": semantic,      # 暂未实现，留插口
+            "semantic": semantic,      # 默认 None 占位；enable_semantic=True 时自动构造
         }
 
     @property
