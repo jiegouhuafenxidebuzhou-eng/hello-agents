@@ -15,7 +15,7 @@ from Agent.Memory.manager import MemoryManager
 
 
 def _new_tool(user_id: str, session_id: str) -> MemoryTool:
-    from Agent.Memory.working import WorkingMemory
+    from Agent.Memory.types.working import WorkingMemory
     working = WorkingMemory(user_id=user_id, session_id=session_id)
     mgr = MemoryManager(working=working, user_id=user_id, session_id=session_id)
     return MemoryTool(mgr, user_id=user_id, session_id=session_id)

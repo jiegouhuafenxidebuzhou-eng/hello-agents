@@ -8,7 +8,7 @@
 
 from datetime import datetime, timedelta
 
-from Agent.Memory.working import WorkingMemory
+from Agent.Memory.types.working import WorkingMemory
 from Agent.Memory.memory_item import make_item
 
 

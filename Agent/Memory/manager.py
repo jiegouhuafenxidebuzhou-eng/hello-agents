@@ -13,7 +13,7 @@ enable_semantic=True 时按本会话身份构造（图谱/LLM 按 env/参数自�
 from typing import Any, Dict, List, Optional
 
 from Agent.Memory.memory_item import MemoryItem
-from Agent.Memory.working import WorkingMemory
+from Agent.Memory.types.working import WorkingMemory
 
 
 class MemoryManager:
@@ -36,12 +36,12 @@ class MemoryManager:
             working = WorkingMemory(user_id=user_id, session_id=session_id)
         # 未显式提供 episodic 但显式开启时，按本会话身份构造一个
         if episodic is None and enable_episodic:
-            from Agent.Memory.episodic import EpisodicMemory
+            from Agent.Memory.types.episodic import EpisodicMemory
             episodic = EpisodicMemory(user_id=user_id, session_id=session_id,
                                      db_path=episodic_db_path)
         # 未显式提供 semantic 但显式开启时，按本会话身份构造一个
         if semantic is None and enable_semantic:
-            from Agent.Memory.semantic import SemanticMemory
+            from Agent.Memory.types.semantic import SemanticMemory
             llm_client = None
             if enable_llm:
                 try:

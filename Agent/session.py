@@ -14,10 +14,10 @@ from typing import Optional
 
 from Agent.LLMClient.llm_client import HelloAgentsLLM
 from Agent.LLMClient.my_agent import MyAgent
-from Agent.Memory.episodic import EpisodicMemory
+from Agent.Memory.types.episodic import EpisodicMemory
 from Agent.Memory.manager import MemoryManager
 from Agent.tools.memory_tool import MemoryTool
-from Agent.Memory.working import WorkingMemory
+from Agent.Memory.types.working import WorkingMemory
 
 
 def build_session_agent(llm_client: HelloAgentsLLM,

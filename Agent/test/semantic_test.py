@@ -15,8 +15,8 @@ add 一条事实后查 graph_store.get_stats()['entity_nodes'] > 0。
 import os
 import tempfile
 
-from Agent.Memory.semantic import SemanticMemory
-from Agent.Memory.episodic import EpisodicMemory
+from Agent.Memory.types.semantic import SemanticMemory
+from Agent.Memory.types.episodic import EpisodicMemory
 
 
 def section(title: str) -> None:
