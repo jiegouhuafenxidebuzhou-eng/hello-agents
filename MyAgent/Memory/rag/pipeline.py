@@ -711,7 +711,7 @@ def search_vectors(
 
 def _prompt_mqe(query: str, n: int) -> List[str]:
     try:
-        from ...ReActAndTool import HelloAgentsLLM
+        from ..core.llm import HelloAgentsLLM
         llm = HelloAgentsLLM()
         prompt = [
             {"role": "system", "content": "你是检索查询扩展助手。生成语义等价或互补的多样化查询。使用中文，简短，避免标点。"},
@@ -727,7 +727,7 @@ def _prompt_mqe(query: str, n: int) -> List[str]:
 
 def _prompt_hyde(query: str) -> Optional[str]:
     try:
-        from ...ReActAndTool import HelloAgentsLLM
+        from ..core.llm import HelloAgentsLLM
         llm = HelloAgentsLLM()
         prompt = [
             {"role": "system", "content": "根据用户问题，先写一段可能的答案性段落，用于向量检索的查询文档（不要分析过程）。"},
