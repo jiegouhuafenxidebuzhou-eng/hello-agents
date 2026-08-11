@@ -1,6 +1,6 @@
 # Hello-Agents / Agent 项目现状梳理
 
-> 生成日期：2026-08-11　｜　最近更新：2026-08-11（情景记忆落地）
+> 生成日期：2026-08-11　｜　最近更新：2026-08-11（语义记忆落地）
 > 范围：仓库根下的 `Agent/` 目录（不含 `MyAgent/`、`Co-creation-projects/` 等）
 > 目的：盘点当前已实现的能力、架构与设计决策，标出缺口，为下一步开发提供基线。
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话定位
 
-`Agent/` 是一个**轻量、纯标准库优先**的 LLM Agent 脚手架：把「LLM 客户端 + 工具调用（ReAct 循环）+ 记忆系统」拼到一起。记忆层已落地**工作记忆 + 情景记忆**两类，语义记忆仍是空占位。
+`Agent/` 是一个**轻量、纯标准库优先**的 LLM Agent 脚手架：把「LLM 客户端 + 工具调用（ReAct 循环）+ 记忆系统」拼到一起。记忆层已落地**工作记忆 + 情景记忆 + 语义记忆**三类，覆盖短期/长期/知识图谱三个维度，`MemoryManager` 的三类后端插口全部填满。
 
 设计取向：**能用标准库就不用重依赖**（`MemoryItem` 用 `dataclass` 而非 `pydantic`，token 估算用字符数而非 `tiktoken`，SQLite 用标准库 `sqlite3`，嵌入模型为可选依赖并带零依赖兜底），与同仓 `MyAgent/Memory/` 那套 pydantic + Qdrant/Neo4j 的重实现形成对照。
 
@@ -28,19 +28,22 @@ Agent/
 │   ├── memory_item.py         #   MemoryItem dataclass + make_item 工厂
 │   ├── working.py             #   WorkingMemory：纯内存工作记忆（增/检索/遗忘）
 │   ├── episodic.py            #   EpisodicMemory：三层情景记忆（缓存+SQLite+Qdrant）
+│   ├── semantic.py            #   SemanticMemory：四层语义记忆（缓存+SQLite+Qdrant+Neo4j 图谱）
 │   ├── embedding.py           #   Embedder 协议 + DashScope/Local/Hashing 三层降级
 │   ├── storage/
 │   │   ├── sqlite_store.py    #     EpisodicSQLiteStore：纯标准库 sqlite3 权威存储
-│   │   └── qdrant_store.py    #     QdrantStore：可选 qdrant-client 向量存储
+│   │   ├── qdrant_store.py    #     QdrantStore：可选 qdrant-client 向量存储
+│   │   └── neo4j_store.py     #     Neo4jStore：可选 neo4j 图存储
 │   ├── manager.py             #   MemoryManager：统一管理 working/episodic/semantic
 │   ├── memory_tool.py         #   MemoryTool：把记忆系统作为 Tool 暴露给 LLM
-│   ├── .env.example           #   统一配置模板（Qdrant/Embedding，情景记忆已消费）
+│   ├── .env.example           #   统一配置模板（Qdrant/Embedding/Neo4j/LLM，已消费）
 │   └── __init__.py            #   空文件
 ├── session.py                 # 会话级 Agent 工厂（方案 A：身份烙入 + 物理隔离）
 └── test/
     ├── working_memory_test.py #   工作记忆 7 项用例
     ├── isolation_test.py      #   多用户/多会话/多线程隔离 5 项用例
-    └── episodic_test.py       #   情景记忆 6 项用例（纯 SQLite 路径，零依赖）
+    ├── episodic_test.py       #   情景记忆 6 项用例（纯 SQLite 路径，零依赖）
+    └── semantic_test.py       #   语义记忆 7 项用例（纯 SQLite 路径，零依赖）
 ```
 
 ---
@@ -53,6 +56,7 @@ Agent/
 - 基于 `openai` SDK 的 OpenAI 兼容封装，配置从 `LLMClient/.env` 读取（`LLM_MODEL_ID` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_TIMEOUT`）。
 - **`think(messages, temperature=0)`**：流式调用，边收边 `print`，返回拼接后的完整文本。用于「纯对话」场景。
 - **`chat(messages, tools=None, temperature=0)`**：非流式，支持原生 function calling；返回 `assistant.message` 对象（含 `tool_calls`）。用于让 LLM 自主决定调工具。
+- **`complete(messages, temperature=0)`**：非流式、**静默**调用，返回完整文本，失败返 `None`（不打印 stdout）。供记忆系统等不需要流式输出的内部任务使用（如语义记忆的三元组抽取），避免 `think()` 的流式噪声掩盖失败。
 - 异常被 catch 后返回 `None`（不抛出），调用方需判空。
 
 #### `tool.py` — 工具体系
@@ -100,6 +104,27 @@ ReAct 循环的封装：
 - `clear()` 只清本 `user_id` 的 episodic（隔离语义，不清全局）。
 - `vector_ready` 标志：仅当 Qdrant 可用 **且** embedder 是真语义（非 hashing）时为 True——hashing 兜底不走向量路径（与关键词检索同质，无意义）。
 
+#### `semantic.py` — `SemanticMemory`（知识图谱后端，四层架构）
+适配 `MemoryManager` 插口（`add/retrieve/forget/get_stats/clear`），四层职责：
+1. **本地缓存**（内存，有界 FIFO `max_cache=200`）：热路径单条命中 + stats；写时同步写 SQLite。
+2. **SQLite 权威存储**（`EpisodicSQLiteStore`，`memory_type="semantic"`）：与 episodic **共用同一张 `memories` 表靠 `memory_type` 分区**，不新建表。
+3. **Qdrant 向量存储**（`QdrantStore`，可选）：语义召回，与 episodic 共用集合，靠 payload `memory_type` 过滤。
+4. **Neo4j 图谱存储**（`Neo4jStore`，可选）：实体-关系知识图谱，图遍历召回——这是语义记忆区别于情景记忆的核心能力。
+
+**三元组抽取**（`_extract_triples`，LLM 优先 + 规则兜底）：
+- **LLM 路径**（`_llm_ready = graph_ready AND llm_client`）：用 `_TRIPLE_SYSTEM_PROMPT` 让 LLM 返回严格 JSON `{entities:[{name,type}], triples:[{subject,predicate,object}]}`，predicate 限大写动词、entity type 限枚举。调 `llm_client.complete()`（静默）。`_parse_triple_json` 剥 markdown 围栏 + 截最外层 `{...}` + 字段校验丢残项。
+- **规则兜底**：复刻 `HashingEmbedder._tokenize` 的 CJK/Latin 分词，取 ≤8 实体两两 `CO_OCCURS`，零依赖、无 stdout 噪声。任何 LLM 失败/异常/无 LLM 时自动回退。
+- 实体 id 用 `md5(name:user_id)[:16]`——**跨进程稳定**（修正参考实现 `hash()` 被 `PYTHONHASHSEED` 盐化导致 MERGE 失效的 bug）+ 跨用户隔离。
+
+检索逻辑：
+- query 为空 → SQLite 按时间倒序取该用户最近 limit 条。
+- 有向量层 → 向量召回写 candidates（子评分 `(向量*0.8+近因*0.2)×(0.8+重要性*0.4)`）。
+- 有图谱层 → 图谱召回：query 分词取实体名 → `search_entities_by_name` → `find_related_entities` 收集路径上的 `memory_id` → 线性衰减打 `graph_score` 写 candidates。
+- 两类都空 → 回退 SQLite `content LIKE` 关键词检索。
+- **融合评分** `combined = (向量*0.6 + 图谱*0.3 + 近因*0.1) × (0.8 + 重要性*0.4)`，回 SQLite 取原文，metadata 带 `relevance/vector/graph/recency` 分数。
+- 图谱写入/删除失败只 log，不阻断权威存储（`_index_to_graph` 整体 try/except）。
+- `graph_ready`/`llm_ready` 标志：无 Neo4j 或无 LLM 时相应关闭，自动降级。
+
 #### `embedding.py` — 嵌入抽象 + 降级链
 `Embedder` 协议（`encode/dimension/available`）+ 三实现按优先级回退：
 1. `DashScopeEmbedder`：OpenAI 兼容 REST（需 `requests` + `EMBED_API_KEY/EMBED_BASE_URL`）——真语义。
@@ -113,13 +138,20 @@ ReAct 循环的封装：
 #### `storage/qdrant_store.py` — `QdrantStore`
 可选依赖 `qdrant-client`，**单例 per (url,collection)**。`available=False` 时所有方法安全降级（`add_vectors→False`、`search_similar→[]`、`delete_by_memory_ids→无操作`）。`qdrant_from_env()` 从 `QDRANT_*` 环境变量构造。按 payload `memory_id` 删除（不依赖点 id）。
 
+#### `storage/neo4j_store.py` — `Neo4jStore`
+可选依赖 `neo4j`，**单例 per (uri,database)**。`available=False` 时所有方法安全降级（`add_entity/add_relationship→False`、`find_related_entities/search_entities_by_name→[]`、`delete_by_*→0`），**构造不抛异常**（与参考实现 `MyAgent/Memory/storage/neo4j_store.py` 的硬失败不同）。`neo4j_from_env()` 从 `NEO4J_*` 环境变量构造。
+
+图 Schema：`:Entity` 节点（`entity_id` 唯一 PK + `name/type/user_id/memory_id/importance`），动态类型关系（带 `memory_id/user_id/strength/evidence`）。方法：`add_entity`（MERGE）、`add_relationship`（MERGE）、`find_related_entities`（变长路径 `[*1..D]`，user 作用域，返回 `rel_memory_ids` 收集候选记忆）、`search_entities_by_name`（`CONTAINS`）、`delete_by_memory_id`（先删关系再删孤儿）、`delete_by_user`、`get_stats`、`health_check`。
+
+**安全要点**：Neo4j 关系类型与变长深度无法参数化，必须拼入 Cypher。`_sanitize_rel_type()` 把任意谓词规整为合法 `[A-Z][A-Z0-9_]*`（大写化 + 非字母数字→`_` + 校验，失败返 None 跳过），`max_depth` clamp 到 `[1,5]`，其余值全走参数——规避参考实现里 f-string 拼接的 Cypher 注入风险。
+
 #### `manager.py` — `MemoryManager`
 - 统一接口：`add / retrieve / forget / stats / clear`，参数带 `memory_type`。
-- `backends = {"working": WorkingMemory, "episodic": <可启用>, "semantic": None}`。
+- `backends = {"working": WorkingMemory, "episodic": <可启用>, "semantic": <可启用>}`。
   - **`episodic` 默认 `None`**，显式传实例或 `enable_episodic=True` 时按本会话身份构造 `EpisodicMemory`。
-  - **`semantic` 仍是 `None` 占位**，调用抛 `ValueError("记忆类型 '...' 未启用")`。
+  - **`semantic` 默认 `None`**，显式传实例或 `enable_semantic=True` 时按本会话身份构造 `SemanticMemory`；`enable_llm=True` 时顺带构造 `HelloAgentsLLM()`（未配 env 抛 `ValueError`→try/except 置 `None`，不阻断语义记忆，仅降级为规则抽取）；`db_path` 默认复用 `episodic_db_path`（共享 SQLite 单例 + `memory_type` 分区），需物理隔离则传 `semantic_db_path`。
   - `retrieve(memory_type="all")` 可跨已启用类型检索并按时间倒序合并。
-- 接口约定（注释里写明）：任何后端只要实现 `add/retrieve/forget/get_stats` 即可挂上，`MemoryTool` 无需改动。
+- 三类后端插口全部填满；任何后端只要实现 `add/retrieve/forget/get_stats` 即可挂上，`MemoryTool` 无需改动。
 
 #### `memory_tool.py` — `MemoryTool`
 - 把 `MemoryManager` 包成单一 Tool 暴露给 LLM，**一个工具搞定增/检索/遗忘/统计**（不为每类记忆单独建工具）。
@@ -156,7 +188,8 @@ MyAgent.run(question)
               registry.execute(name, args)
                 └─ 若是 memory 工具 ──► MemoryManager.add/retrieve/forget/stats
                                           ├─ WorkingMemory（纯内存）
-                                          └─ EpisodicMemory（缓存+SQLite+Qdrant，可选）
+                                          ├─ EpisodicMemory（缓存+SQLite+Qdrant，可选）
+                                          └─ SemanticMemory（缓存+SQLite+Qdrant+Neo4j，可选）
               结果以 role=tool 回填 messages ──► 进入下一步
 ```
 
@@ -181,6 +214,27 @@ forget(id) ──► 缓存移除 ──► SQLite delete ──► [向量层�
 clear() ──► SQLite delete by (user_id, episodic) ──► Qdrant 删本用户 episodic 向量 ──► 清缓存
 ```
 
+### 4.4 语义记忆的生命周期（四层）
+```
+add ──► 本地缓存(FIFO 有界) ──► SQLite(权威, memory_type='semantic') ──► [向量层可用?] encode+upsert Qdrant
+                                                                              (失败仅 log,不影响权威)
+                                          └─► [图谱层可用?] _index_to_graph:
+                                                 _extract_triples ──► [LLM 可用?] LLM 抽 JSON 三元组
+                                                                                       (失败/无 LLM ↓)
+                                                                  回退规则: CJK 分词取实体, 两两 CO_OCCURS
+                                                 → add_entity (MERGE by entity_id) + add_relationship
+                                                 (整步 try/except, 图谱失败不阻断权威存储)
+retrieve(query):
+  ├─ query 空 ─────────────► SQLite 按时间倒序取本用户最近 limit
+  ├─ vector_ready ────────► Qdrant 向量召回 ─► 写 candidates (子评分 向量.8+近因.2 ×重要性权重)
+  ├─ graph_ready ─────────► query 分词取实体名 → 搜实体 → find_related_entities 收集 memory_id
+  │                          → 线性衰减打 graph_score ─► 写 candidates
+  ├─ 两类都空 ─────────────► 回退 SQLite content LIKE 关键词
+  └─ 融合: combined=(向量.6+图谱.3+近因.1)×(0.8+重要性.4) ─► 回 SQLite 取原文 ─► 取 limit
+forget(id) ──► 缓存移除 ──► SQLite delete ──► [向量层] Qdrant 删 ──► [图谱层] delete_by_memory_id (先删关系再删孤儿)
+clear() ──► SQLite delete by (user_id, semantic) ──► Qdrant 删本用户 semantic 向量 ──► Neo4j delete_by_user ──► 清缓存
+```
+
 ---
 
 ## 5. 配置
@@ -193,13 +247,13 @@ LLM_BASE_URL="https://api.deepseek.com"
 SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 ```
 
-`Memory/.env.example`（情景记忆已消费其中 Qdrant/Embedding 变量；复制为 `Agent/Memory/.env` 后生效）：
+`Memory/.env.example`（情景/语义记忆已消费其中 Qdrant/Embedding/Neo4j/LLM 变量；复制为 `Agent/Memory/.env` 后生效）：
 - LLM 四件套、Tavily/SerpApi。
 - Qdrant：`QDRANT_URL/QDRANT_API_KEY/QDRANT_COLLECTION/QDRANT_VECTOR_SIZE/QDRANT_DISTANCE`（不配则向量层关闭，降级关键词）。
 - Embedding：`EMBED_MODEL_TYPE(dashscope|local|hashing，默认 hashing)/EMBED_MODEL_NAME/EMBED_API_KEY/EMBED_BASE_URL/EMBED_DIM`（不配真模型则 hashing 兜底，仍可用）。
-- Neo4j：仅模板预留，当前 Agent/ 实现未消费（为未来 semantic 留）。
+- Neo4j：`NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD/NEO4J_DATABASE` 等（不配则图谱层关闭，语义记忆降级为向量+关键词检索）。语义记忆的三元组抽取默认走规则兜底；配齐 LLM 后自动升级为 LLM 抽取。
 
-> 情景记忆的「最小可跑」配置：**零额外环境变量**——默认 hashing embedder + 无 Qdrant → 纯 SQLite + 关键词检索即可工作。配齐 Qdrant + 真 embedder 后自动升级为语义召回，无需改代码。
+> 情景/语义记忆的「最小可跑」配置：**零额外环境变量**——默认 hashing embedder + 无 Qdrant + 无 Neo4j + 无 LLM → 纯 SQLite + 关键词检索即可工作。配齐 Qdrant + 真 embedder 后升级语义召回，再加 Neo4j 升级图遍历召回，再加 LLM 升级三元组抽取——逐层叠加，无需改代码。
 
 ---
 
@@ -210,8 +264,9 @@ SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 | `test/working_memory_test.py` | 增/检索/关键词过滤/主动遗忘/TTL 过期/容量驱逐/Token 驱逐/limit | `python -m Agent.test.working_memory_test` |
 | `test/isolation_test.py` | 跨用户隔离/同用户跨会话隔离/身份烙入/LLM 无法伪造身份/8 用户并发无串读 | `python -m Agent.test.isolation_test` |
 | `test/episodic_test.py` | 增/关键词检索/遗忘/跨用户隔离/跨会话长期召回/降级可用（纯 SQLite，零依赖） | `python -m Agent.test.episodic_test` |
+| `test/semantic_test.py` | 增/关键词检索/遗忘/跨用户隔离/跨会话长期召回/降级可用/与情景记忆分区隔离（纯 SQLite，零依赖） | `python -m Agent.test.semantic_test` |
 
-注：测试通过 `__main__` 直接跑函数，非 `pytest` 断言框架；`isolation_test` / `episodic_test` 里用 `assert`，可用 `python -m` 执行。导入路径要求从仓库根运行。`episodic_test` 用临时 db 跑完自动清理。
+注：测试通过 `__main__` 直接跑函数，非 `pytest` 断言框架；`isolation_test` / `episodic_test` / `semantic_test` 里用 `assert`，可用 `python -m` 执行。导入路径要求从仓库根运行。`episodic_test` / `semantic_test` 用临时 db 跑完自动清理。LLM + Neo4j 真路径需配 `.env`，无法单测，手动验证步骤见测试文件 docstring。
 
 ---
 
@@ -226,35 +281,42 @@ SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 7. **情景记忆三层 + 降级**（新增）：本地缓存 + SQLite 权威 + Qdrant 向量，后两层均为可选依赖；未装 `qdrant-client`/未配真嵌入时自动退化为「SQLite + 关键词」，`pip install openai python-dotenv` 即可跑通。配齐后无缝升级语义召回。
 8. **真语义才走向量**（新增）：`vector_ready` 要求 Qdrant 可用 **且** embedder 非 hashing 兜底——hashing 与关键词检索同质，走向量无意义。避免「装了 Qdrant 但没真模型」时做无效计算。
 9. **SQLite 自建而非复用**（新增）：参考 `MyAgent/Memory/storage/document_store.py` 但在 `Agent/` 内用标准库重写精简版，避免跨目录耦合与 pydantic 重依赖，贴合本项目标准库优先哲学。规避了参考实现里的 bug（`from venv import logger`、`timedelta.hours`、无界缓存等）。
+10. **语义记忆四层 + 全栈降级**（新增）：缓存 + SQLite 权威 + Qdrant 向量 + Neo4j 图谱，后三层均为可选依赖；未装 `neo4j`/`qdrant-client`/未配真嵌入/未配 LLM 时逐层自动退化，最终退到「SQLite + 关键词」仍可用。与情景记忆降级哲学一致。
+11. **LLM 三元组抽取 + 规则兜底**（新增）：LLM 抽真语义三元组（`WORKS_AT`/`LOCATED_IN` 等），比参考实现的 spaCy NER + 两两 `CO_OCCURS` 更强；但 spaCy 重依赖且语言模型大，本项目改用「LLM 优先 + 复刻 HashingEmbedder 分词的规则兜底」，零依赖仍能建图。
+12. **实体 id 跨进程稳定**（新增）：`md5(name:user_id)` 而非参考实现的 `hash(name)`——后者被 `PYTHONHASHSEED` 盐化，跨进程/重启后同实体 MERGE 失效、图谱碎片化。
+13. **Cypher 注入防御**（新增）：关系类型无法参数化，`_sanitize_rel_type` 白名单校验 + `max_depth` clamp + 其余值全参数化，规避参考实现 f-string 拼 Cypher 的注入风险。
+14. **语义与情景共享 SQLite**（新增）：同一张 `memories` 表靠 `memory_type` 分区（semantic_test 7 验证不串读），单例 store 复用，不新建表——贴合标准库优先与极简取向。需物理隔离可传 `semantic_db_path`。
 
 ---
 
 ## 8. 现状能力清单 & 缺口
 
 ### ✅ 已实现
-- LLM 客户端（流式 + function calling）
+- LLM 客户端（流式 + function calling + 静默 `complete()`）
 - 工具体系（注册/查询/执行 + 让 LLM 自查工具清单的内置工具）
 - ReAct Agent 循环（LLM 自主调工具 → 回填 → 收敛）
 - 工作记忆全功能（增/检索/遗忘，TTL + 驱逐 + 主动遗忘）
 - **情景记忆全功能**（三层：本地缓存 + SQLite 权威 + Qdrant 向量；增/检索/遗忘/清空；跨会话召回；可选依赖+降级）
+- **语义记忆全功能**（四层：本地缓存 + SQLite 权威 + Qdrant 向量 + Neo4j 图谱；LLM 三元组抽取 + 规则兜底；向量+图谱融合检索；增/检索/遗忘/清空；跨会话召回；全栈降级）
+- **Neo4j 图存储**（可选依赖 neo4j，优雅降级，Cypher 注入防御）
 - **Embedding 抽象 + 三层降级链**（DashScope/Local/Hashing 零依赖兜底）
-- 记忆作为工具暴露给 LLM（统一 memory 工具，working/episodic 同一个工具切换）
-- 多用户/多会话/多线程隔离（含身份防伪造，工作记忆 + 情景记忆均隔离）
-- 工作记忆 7 项 + 隔离 5 项 + 情景记忆 6 项测试
+- 记忆作为工具暴露给 LLM（统一 memory 工具，working/episodic/semantic 同一个工具切换）
+- 多用户/多会话/多线程隔离（含身份防伪造，三类记忆均隔离）
+- 工作记忆 7 项 + 隔离 5 项 + 情景记忆 6 项 + 语义记忆 7 项测试
 
 ### ❌ 缺口（按优先级）
 | 优先级 | 缺口 | 说明 | 可复用资源 |
 |---|---|---|---|
-| 高 | **语义记忆 `semantic` 后端** | `MemoryManager.backends["semantic"]` 仍是 `None`，调用抛错 | `MyAgent/Memory/type/semantic.py`、`storage/neo4j_store.py` |
-| 中 | **记忆整合（consolidation）** | 工作记忆高重要性项 → 情景记忆的沉淀机制缺失（参考 MyAgent 的 `consolidate_memories`） | `MyAgent/Memory/manager.py` |
+| 中 | **记忆整合（consolidation）** | 工作记忆高重要性项 → 情景/语义记忆的沉淀机制缺失（参考 MyAgent 的 `consolidate_memories`） | `MyAgent/Memory/manager.py` |
 | 中 | **业务工具示例** | `MyAgent` 已能挂任意 Tool，但仓库内 `Agent/` 没有现成业务工具（搜索/计算等） | 同仓多项目有实现可借鉴 |
+| 中 | **语义记忆自动沉淀** | 当前需 LLM/Agent 显式 `add(memory_type="semantic")`；缺从对话/情景记忆自动抽取事实沉淀的机制 | `MyAgent/Memory/manager.py` 的 auto-classify |
 | 低 | **token 精确化** | 工作记忆 token 用字符数估算偏粗，中文场景偏差更大 | 接 `tiktoken` 即可 |
 | 低 | **工作记忆持久化** | 工作记忆纯内存，进程重启即失（设计如此，非缺陷） | — |
 
 ### 🔁 与 `MyAgent/Memory/` 的关系
 同仓库 `MyAgent/Memory/` 已有一套**更完整但更重**的记忆系统：pydantic `MemoryItem`、`BaseMemory` 抽象基类、working/episodic/semantic/perceptual 四类、auto-classify、importance 计算、consolidation、多种 forget 策略、Qdrant/Neo4j 存储、RAG pipeline、Embedding。两条线接口风格不同（`Agent/` 用 `add/retrieve/forget`，`MyAgent/` 用 `add_memory/retrieve_memories/...`）。
 
-情景记忆实现时，**参考了 `MyAgent/Memory/type/episodic.py` 的三层思路，但在 `Agent/` 内用标准库自建精简版**（SQLite/Qdrant/Embedding 均重写），未跨目录 import，规避了参考实现里的若干 bug。下一步补 semantic 时可同样参考 `MyAgent/Memory/type/semantic.py` + Neo4j 存储。
+情景记忆实现时，**参考了 `MyAgent/Memory/type/episodic.py` 的三层思路，但在 `Agent/` 内用标准库自建精简版**（SQLite/Qdrant/Embedding 均重写），未跨目录 import，规避了参考实现里的若干 bug。语义记忆同样**参考了 `MyAgent/Memory/type/semantic.py` + `storage/neo4j_store.py` 的图谱思路，但在 `Agent/` 内自建**（`Neo4jStore` 优雅降级而非硬失败、`md5` 实体 id 而非 `hash()`、LLM 三元组抽取而非 spaCy NER、Cypher 注入防御），并复用了情景记忆已建好的 SQLite/Qdrant/Embedding 基础设施。
 
 ---
 
@@ -272,7 +334,8 @@ SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 
 ## 10. 下一步候选方向
 
-1. **补齐 semantic 后端**（最高价值）：填上 `MemoryManager` 最后一个空插口。可参考 `MyAgent/Memory/type/semantic.py` + `storage/neo4j_store.py`，在本项目内自建轻量版（图存储或复用 SQLite 的 concepts 表）。
-2. **记忆整合（consolidation）**：工作记忆里高重要性项按阈值沉淀到情景记忆，参考 `MyAgent/Memory/manager.py` 的 `consolidate_memories`。
+1. **记忆整合（consolidation）**（最高价值）：工作记忆里高重要性项按阈值沉淀到情景/语义记忆，参考 `MyAgent/Memory/manager.py` 的 `consolidate_memories`。语义记忆尤其可借此从对话/情景记忆里自动抽取事实沉淀为知识图谱，无需 LLM 显式 `add`。
+2. **语义记忆自动沉淀**：在 ReAct 循环或会话结束时，自动跑一次三元组抽取把本轮关键事实写入语义记忆——让图谱随对话增长。
 3. **扩展业务工具**：在 `MyAgent` 上挂搜索/计算/数据库/MCP 等工具，补全 Agent 的「手」。
-4. **真语义嵌入接入**：配齐 `EMBED_MODEL_TYPE=dashscope` 或 `local` + Qdrant，让情景记忆从关键词检索升级为语义召回（代码已就绪，仅需配置）。
+4. **真语义嵌入 + 图谱接入**：配齐 `EMBED_MODEL_TYPE=dashscope` 或 `local` + Qdrant + Neo4j + LLM，让语义记忆从「SQLite 关键词」逐层升级为「向量召回 + 图遍历召回 + LLM 抽取」全能力（代码已就绪，仅需配置）。
+5. **感知记忆（perceptual）**：`MyAgent/Memory/type/perceptual.py` 仍是空文件，若有多模态输入需求可补第四类记忆。
