@@ -8,10 +8,9 @@
     python -m Agent.Memory.isolation_test
 """
 
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from Agent.Memory.memory_tool import MemoryTool
+from Agent.tools.memory_tool import MemoryTool
 from Agent.Memory.manager import MemoryManager
 
 

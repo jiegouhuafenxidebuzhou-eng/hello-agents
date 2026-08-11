@@ -140,7 +140,10 @@ class HashingEmbedder(Embedder):
         tokens: List[str] = []
         buf = []
         for ch in text:
-            if ch.isalnum():
+            # CJK 等非拉丁字符在 Python 里 isalnum() 也为 True，但语义上应按单字成词
+            # （否则一整句中文会被当成一个 token，hashing 向量对中文失效）。
+            if ch.isalnum() and ord(ch) <= 0x2E80:
+                # Latin/ASCII 字母数字：accumulate 成词
                 buf.append(ch)
             else:
                 if buf:
@@ -149,6 +152,7 @@ class HashingEmbedder(Embedder):
                 if ch.strip() and ord(ch) > 0x2E80:
                     # CJK 等非拉丁字符按单字成词
                     tokens.append(ch.lower())
+                # 其余（标点/空白）仅作分隔符
         if buf:
             tokens.append("".join(buf).lower())
         return tokens

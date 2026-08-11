@@ -14,10 +14,9 @@ from typing import Optional
 
 from Agent.LLMClient.llm_client import HelloAgentsLLM
 from Agent.LLMClient.my_agent import MyAgent
-from Agent.LLMClient.tool import Tool
 from Agent.Memory.episodic import EpisodicMemory
 from Agent.Memory.manager import MemoryManager
-from Agent.Memory.memory_tool import MemoryTool
+from Agent.tools.memory_tool import MemoryTool
 from Agent.Memory.working import WorkingMemory
 
 
@@ -27,7 +26,9 @@ def build_session_agent(llm_client: HelloAgentsLLM,
                         extra_tools: Optional[list] = None,
                         max_steps: int = 10,
                         enable_episodic: bool = False,
-                        episodic_db_path: Optional[str] = None) -> MyAgent:
+                        episodic_db_path: Optional[str] = None,
+                        enable_rag: bool = False,
+                        rag_namespace: str = "default") -> MyAgent:
     """为一个会话构造专属 Agent。
 
     Args:
@@ -37,6 +38,11 @@ def build_session_agent(llm_client: HelloAgentsLLM,
         extra_tools: 除记忆工具外，该会话还需要挂载的工具。
         enable_episodic: 是否启用情景记忆（SQLite 权威层 + 可选 Qdrant 向量层）。
         episodic_db_path: 情景记忆 SQLite 路径，None 用默认。
+        enable_rag: 是否挂载 RAG 工具（外部知识库检索增强生成）。默认关闭；
+            开启后 LLM 可在 ReAct 循环里自主调 `rag` 工具。无 Qdrant 时自动
+            降级为内存向量库，无 LLM 时 ask 降级为返回原文片段。
+        rag_namespace: RAG 知识库命名空间（做多知识库隔离），构造时烙入，
+            LLM 不可指定。默认 "default"。
     """
     # 本会话专属的工作记忆，身份烙入
     working = WorkingMemory(user_id=user_id, session_id=session_id)
@@ -49,4 +55,8 @@ def build_session_agent(llm_client: HelloAgentsLLM,
     mem_tool = MemoryTool(manager, user_id=user_id, session_id=session_id)
 
     tools = [mem_tool] + list(extra_tools or [])
+    if enable_rag:
+        from Agent.tools.rag_tool import RAGTool
+        # RAG 是外部共享知识，namespace 在构造时烙入；llm_client 复用全局实例
+        tools.append(RAGTool(rag_namespace=rag_namespace, llm_client=llm_client))
     return MyAgent(llm_client=llm_client, tools=tools, max_steps=max_steps)

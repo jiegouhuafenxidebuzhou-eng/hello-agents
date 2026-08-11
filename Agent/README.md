@@ -1,6 +1,6 @@
 # Hello-Agents / Agent 项目现状梳理
 
-> 生成日期：2026-08-11　｜　最近更新：2026-08-11（语义记忆落地）
+> 生成日期：2026-08-11　｜　最近更新：2026-08-11（RAG 工具落地）
 > 范围：仓库根下的 `Agent/` 目录（不含 `MyAgent/`、`Co-creation-projects/` 等）
 > 目的：盘点当前已实现的能力、架构与设计决策，标出缺口，为下一步开发提供基线。
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话定位
 
-`Agent/` 是一个**轻量、纯标准库优先**的 LLM Agent 脚手架：把「LLM 客户端 + 工具调用（ReAct 循环）+ 记忆系统」拼到一起。记忆层已落地**工作记忆 + 情景记忆 + 语义记忆**三类，覆盖短期/长期/知识图谱三个维度，`MemoryManager` 的三类后端插口全部填满。
+`Agent/` 是一个**轻量、纯标准库优先**的 LLM Agent 脚手架：把「LLM 客户端 + 工具调用（ReAct 循环）+ 记忆系统 + RAG 知识库」拼到一起。记忆层已落地**工作记忆 + 情景记忆 + 语义记忆**三类，覆盖短期/长期/知识图谱三个维度；RAG 层以 `rag_tool` 为入口提供外部文档检索增强生成，与 Memory 分工互补。`MemoryManager` 的三类后端插口全部填满。
 
 设计取向：**能用标准库就不用重依赖**（`MemoryItem` 用 `dataclass` 而非 `pydantic`，token 估算用字符数而非 `tiktoken`，SQLite 用标准库 `sqlite3`，嵌入模型为可选依赖并带零依赖兜底），与同仓 `MyAgent/Memory/` 那套 pydantic + Qdrant/Neo4j 的重实现形成对照。
 
@@ -34,8 +34,11 @@ Agent/
 │   │   ├── sqlite_store.py    #     EpisodicSQLiteStore：纯标准库 sqlite3 权威存储
 │   │   ├── qdrant_store.py    #     QdrantStore：可选 qdrant-client 向量存储
 │   │   └── neo4j_store.py     #     Neo4jStore：可选 neo4j 图存储
+│   ├── rag/
+│   │   └── pipeline.py        #     RAG 管道：文档解析→分块→向量化→检索（含内存兜底向量库）
 │   ├── manager.py             #   MemoryManager：统一管理 working/episodic/semantic
 │   ├── memory_tool.py         #   MemoryTool：把记忆系统作为 Tool 暴露给 LLM
+│   ├── rag_tool.py            #   RAGTool：把外部知识库检索增强生成作为 Tool 暴露给 LLM
 │   ├── .env.example           #   统一配置模板（Qdrant/Embedding/Neo4j/LLM，已消费）
 │   └── __init__.py            #   空文件
 ├── session.py                 # 会话级 Agent 工厂（方案 A：身份烙入 + 物理隔离）
@@ -43,7 +46,8 @@ Agent/
     ├── working_memory_test.py #   工作记忆 7 项用例
     ├── isolation_test.py      #   多用户/多会话/多线程隔离 5 项用例
     ├── episodic_test.py       #   情景记忆 6 项用例（纯 SQLite 路径，零依赖）
-    └── semantic_test.py       #   语义记忆 7 项用例（纯 SQLite 路径，零依赖）
+    ├── semantic_test.py       #   语义记忆 7 项用例（纯 SQLite 路径，零依赖）
+    └── rag_test.py            #   RAG 工具 6 项用例（内存向量库 + hashing embedder，零依赖）
 ```
 
 ---
@@ -158,11 +162,27 @@ ReAct 循环的封装：
 - 参数：`action(add/retrieve/forget/stats)` + `memory_type(working/episodic/semantic/all)` + `content/query/memory_id/limit/importance`。
 - **安全设计（方案 A）**：`user_id` / `session_id` 在 `MemoryTool` 构造时烙入，**不出现在 function 参数 schema 里**，因此 LLM 无法伪造身份——即使调用时硬塞 `user_id="bob"` 也会被忽略。
 
+#### `rag_tool.py` + `rag/pipeline.py` — RAG 工具（外部知识库检索增强生成）
+与 Memory 的分工（参考第八章 §11）：**Memory 管「我和用户经历过什么」**（个人历史/偏好，按 user_id 隔离）；**RAG 管「外部文档里有什么可用知识」**（知识库问答/引用，按 `rag_namespace` 隔离，全局共享不绑 user_id）。
+
+`RAGTool(Tool)` 把知识库作为单一 Tool 暴露给 LLM，参数 `action(add_document/add_text/ask/search/stats/clear)` + `file_path/text/question/query/limit/include_citations/confirm`。**身份防伪造（方案 A）**：`rag_namespace`/collection 在构造时烙入，不进 function schema，LLM 无法切换到别人的命名空间。
+
+`rag/pipeline.py` 实现 RAG 全流程，复用 Agent 已有基础设施（不跨目录 import MyAgent）：
+- **文档解析（标准库优先）**：文本类格式（txt/md/csv/json/py/yaml 等）纯 stdlib `open().read()`；富格式（PDF/Office/图片/音频）走**可选依赖** `markitdown`，未装则跳过该文件并提示，不崩溃。分块移植参考的 markdown 感知分块（`_split_paragraphs_with_headings` + `_chunk_paragraphs` + `_approx_token_len`），纯 stdlib，保留 `heading_path`/`start`/`end`/`doc_id`/`content_hash` 元数据 + 跨文件内容去重。
+- **向量化**：复用 `Agent.Memory.embedding.get_embedder()`（DashScope/Local/Hashing 三级降级）。RAG 不做 `vector_ready` 门控——hashing embedder 也照常入库（关键词级召回也是有效 RAG）。
+- **向量库**：优先 `QdrantStore`（独立集合 `hello_agents_rag_vectors`，env `QDRANT_RAG_COLLECTION`，与记忆集合物理隔离避免污染 HNSW）；**Qdrant 不可用时自动落到 `InMemoryVectorStore`**（纯 stdlib list + 余弦扫描），小知识库零依赖可跑，进程重启即失。签名对齐 `QdrantStore`（`add_vectors(vectors,payloads,ids)` / `search_similar→[{"score","payload"}]`）。
+- **检索**：基础 `search_vectors`（where 过滤 `memory_type`+`rag_namespace`，score_threshold 后置过滤）；高级 `search_vectors_expanded` 支持 **MQE 多查询扩展 + HyDE 假设文档嵌入**（LLM 可用时走 `complete()`，失败回退原 query），跨扩展按 `memory_id` 去重取最高分。
+- **ask 流程**：检索→拼上下文（智能截断 `max_chars`）→`HelloAgentsLLM.complete()` 生成答案→带引用来源格式化。**无 LLM 时降级为返回检索到的原文片段**（不编造）。
+- **裁剪**：未移植参考里的 cross-encoder rerank / graph signals / neighbor expansion（Agent 无 RAG 侧 Neo4j，且这些是重依赖），rerank 留作后续扩展点。
+
+降级链（对齐 Agent 哲学，逐层叠加无需改代码）：无 Qdrant→内存向量库；无真嵌入→hashing 关键词级；无 LLM→ask 返回原文片段。`pip install openai python-dotenv` 即可跑通；配齐 Qdrant+真 embedder 升级语义召回，再加 LLM 升级自然语言答案。
+
 ### 3.3 `session.py` — 会话级工厂
 
-`build_session_agent(llm_client, user_id, session_id, extra_tools, max_steps, enable_episodic=False, episodic_db_path=None)`：
+`build_session_agent(llm_client, user_id, session_id, extra_tools, max_steps, enable_episodic=False, episodic_db_path=None, enable_rag=False, rag_namespace="default")`：
 - 每个会话构造**全新的** `WorkingMemory` → `MemoryManager` → `MemoryTool` → `MyAgent`，身份烙入。
 - `enable_episodic=True` 时额外构造一个 `EpisodicMemory`（身份烙入）挂进 manager；SQLite/Qdrant 虽全局共享单例，但所有读写带 `user_id` 过滤，跨会话可召回长期记忆而互不串读。
+- `enable_rag=True` 时额外构造 `RAGTool`（`rag_namespace` 烙入，llm_client 复用全局实例）挂进 tools；LLM 可在 ReAct 循环里自主调 `rag` 工具检索外部知识库。无 Qdrant 时降级内存向量库，无 LLM 时 ask 降级返回原文片段。
 - `HelloAgentsLLM` 是无状态 HTTP 客户端，全局共享、不重复建。
 - **隔离方式**：不同会话 = 不同 Python 对象 → 物理隔离，无需过滤、无需加锁。
 
@@ -235,6 +255,26 @@ forget(id) ──► 缓存移除 ──► SQLite delete ──► [向量层] 
 clear() ──► SQLite delete by (user_id, semantic) ──► Qdrant 删本用户 semantic 向量 ──► Neo4j delete_by_user ──► 清缓存
 ```
 
+### 4.5 RAG 知识库的生命周期（与 Memory 分工：外部文档 vs 个人历史）
+```
+add_document(file_path) ──► _convert_to_markdown [文本类:stdlib / 富格式:可选markitdown]
+                          ──► _split_paragraphs_with_headings ──► _chunk_paragraphs(overlap)
+                          ──► 内容去重(content_hash) ──► index_chunks:
+                                 embedder.encode_batch ──► store.add_vectors(vectors,payloads,ids)
+                                 payload: memory_type=rag_chunk / rag_namespace / source_path / doc_id / content / is_rag_data
+                          (Qdrant 不可用 → InMemoryVectorStore 兜底; hashing embedder 也照常入库)
+
+ask(question):
+  ├─ [LLM 可用] search_advanced: MQE 多查询 + HyDE 假设文档 ──► 多路向量召回 ──► memory_id 去重取最高分
+  └─ [无 LLM ] search: 单 query 向量召回
+  ──► 拼上下文(智能截断 max_chars) ──► [LLM 可用] complete() 生成自然语言答案 + 引用来源
+                                       [无 LLM ] 降级返回检索到的原文片段(不编造)
+search(query) ──► 向量召回 ──► where 过滤(memory_type+rag_namespace) ──► score_threshold 后置 ──► 返回片段+相似度
+clear(confirm=true) ──► 重建该 namespace 管道(内存库清空 / Qdrant 侧重建集合)
+```
+
+> RAG 与 Memory 检索路由（参考第八章 §15）：涉及用户历史/偏好 → memory 工具；涉及外部文档/手册/知识库 → rag 工具；复杂助手常同时调用二者。
+
 ---
 
 ## 5. 配置
@@ -265,6 +305,7 @@ SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 | `test/isolation_test.py` | 跨用户隔离/同用户跨会话隔离/身份烙入/LLM 无法伪造身份/8 用户并发无串读 | `python -m Agent.test.isolation_test` |
 | `test/episodic_test.py` | 增/关键词检索/遗忘/跨用户隔离/跨会话长期召回/降级可用（纯 SQLite，零依赖） | `python -m Agent.test.episodic_test` |
 | `test/semantic_test.py` | 增/关键词检索/遗忘/跨用户隔离/跨会话长期召回/降级可用/与情景记忆分区隔离（纯 SQLite，零依赖） | `python -m Agent.test.semantic_test` |
+| `test/rag_test.py` | 添加文本/搜索/ask降级/分块去重/命名空间隔离/统计+清空/降级可用（内存向量库+hashing，零依赖） | `python -m Agent.test.rag_test` |
 
 注：测试通过 `__main__` 直接跑函数，非 `pytest` 断言框架；`isolation_test` / `episodic_test` / `semantic_test` 里用 `assert`，可用 `python -m` 执行。导入路径要求从仓库根运行。`episodic_test` / `semantic_test` 用临时 db 跑完自动清理。LLM + Neo4j 真路径需配 `.env`，无法单测，手动验证步骤见测试文件 docstring。
 
@@ -301,8 +342,9 @@ SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 - **Neo4j 图存储**（可选依赖 neo4j，优雅降级，Cypher 注入防御）
 - **Embedding 抽象 + 三层降级链**（DashScope/Local/Hashing 零依赖兜底）
 - 记忆作为工具暴露给 LLM（统一 memory 工具，working/episodic/semantic 同一个工具切换）
-- 多用户/多会话/多线程隔离（含身份防伪造，三类记忆均隔离）
-- 工作记忆 7 项 + 隔离 5 项 + 情景记忆 6 项 + 语义记忆 7 项测试
+- **RAG 工具**（外部知识库检索增强生成；rag_tool 统一入口，add_document/add_text/ask/search/stats/clear；markdown 感知分块；MQE+HyDE 扩展检索；内存向量库兜底；无 LLM 时 ask 降级返回原文片段；与 Memory 分工互补）
+- 多用户/多会话/多线程隔离（含身份防伪造，三类记忆均隔离 + RAG 命名空间隔离）
+- 工作记忆 7 项 + 隔离 5 项 + 情景记忆 6 项 + 语义记忆 7 项 + RAG 6 项测试
 
 ### ❌ 缺口（按优先级）
 | 优先级 | 缺口 | 说明 | 可复用资源 |
@@ -311,12 +353,13 @@ SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 | 中 | **业务工具示例** | `MyAgent` 已能挂任意 Tool，但仓库内 `Agent/` 没有现成业务工具（搜索/计算等） | 同仓多项目有实现可借鉴 |
 | 中 | **语义记忆自动沉淀** | 当前需 LLM/Agent 显式 `add(memory_type="semantic")`；缺从对话/情景记忆自动抽取事实沉淀的机制 | `MyAgent/Memory/manager.py` 的 auto-classify |
 | 低 | **token 精确化** | 工作记忆 token 用字符数估算偏粗，中文场景偏差更大 | 接 `tiktoken` 即可 |
+| 低 | **RAG 重排序** | 当前 RAG 仅向量召回 + MQE/HyDE 扩展，未接 cross-encoder 重排序，专业领域召回精度可提升 | 参考实现 `rerank_with_cross_encoder` |
 | 低 | **工作记忆持久化** | 工作记忆纯内存，进程重启即失（设计如此，非缺陷） | — |
 
 ### 🔁 与 `MyAgent/Memory/` 的关系
 同仓库 `MyAgent/Memory/` 已有一套**更完整但更重**的记忆系统：pydantic `MemoryItem`、`BaseMemory` 抽象基类、working/episodic/semantic/perceptual 四类、auto-classify、importance 计算、consolidation、多种 forget 策略、Qdrant/Neo4j 存储、RAG pipeline、Embedding。两条线接口风格不同（`Agent/` 用 `add/retrieve/forget`，`MyAgent/` 用 `add_memory/retrieve_memories/...`）。
 
-情景记忆实现时，**参考了 `MyAgent/Memory/type/episodic.py` 的三层思路，但在 `Agent/` 内用标准库自建精简版**（SQLite/Qdrant/Embedding 均重写），未跨目录 import，规避了参考实现里的若干 bug。语义记忆同样**参考了 `MyAgent/Memory/type/semantic.py` + `storage/neo4j_store.py` 的图谱思路，但在 `Agent/` 内自建**（`Neo4jStore` 优雅降级而非硬失败、`md5` 实体 id 而非 `hash()`、LLM 三元组抽取而非 spaCy NER、Cypher 注入防御），并复用了情景记忆已建好的 SQLite/Qdrant/Embedding 基础设施。
+情景记忆实现时，**参考了 `MyAgent/Memory/type/episodic.py` 的三层思路，但在 `Agent/` 内用标准库自建精简版**（SQLite/Qdrant/Embedding 均重写），未跨目录 import，规避了参考实现里的若干 bug。语义记忆同样**参考了 `MyAgent/Memory/type/semantic.py` + `storage/neo4j_store.py` 的图谱思路，但在 `Agent/` 内自建**（`Neo4jStore` 优雅降级而非硬失败、`md5` 实体 id 而非 `hash()`、LLM 三元组抽取而非 spaCy NER、Cypher 注入防御），并复用了情景记忆已建好的 SQLite/Qdrant/Embedding 基础设施。RAG 工具同样**参考了 `MyAgent/Memory/tools/builtin/rag_tool.py` + `rag/document.py` 的全流程，但在 `Agent/` 内自建**：Tool 基类改用 Agent 的 `Tool`（`name/description/parameters` 属性 + `run(**kwargs)`）而非 MyAgent 的 `Tool/ToolParameter`；向量库复用 Agent 的 `QdrantStore`（签名 `payloads=`/返回 `payload`）而非 MyAgent 的 `QdrantVectorStore`，且 Qdrant 不可用时落到自建的 `InMemoryVectorStore` 兜底（参考实现是硬失败）；文档解析改 stdlib 优先 + 可选 markitdown（参考硬依赖 markitdown）；LLM 调用走 Agent 的 `complete()`（静默降级）；裁剪了 cross-encoder rerank / graph signals / neighbor expansion 等重逻辑，保留 markdown 感知分块 + MQE/HyDE 扩展检索。
 
 ---
 
@@ -336,6 +379,6 @@ SERPAPI_API_KEY="YOUR_SERPAPI_API_KEY"
 
 1. **记忆整合（consolidation）**（最高价值）：工作记忆里高重要性项按阈值沉淀到情景/语义记忆，参考 `MyAgent/Memory/manager.py` 的 `consolidate_memories`。语义记忆尤其可借此从对话/情景记忆里自动抽取事实沉淀为知识图谱，无需 LLM 显式 `add`。
 2. **语义记忆自动沉淀**：在 ReAct 循环或会话结束时，自动跑一次三元组抽取把本轮关键事实写入语义记忆——让图谱随对话增长。
-3. **扩展业务工具**：在 `MyAgent` 上挂搜索/计算/数据库/MCP 等工具，补全 Agent 的「手」。
+3. **扩展业务工具**：在 `MyAgent` 上挂搜索/计算/数据库/MCP 等工具，补全 Agent 的「手」（RAG 工具已就绪，可与之协同）。
 4. **真语义嵌入 + 图谱接入**：配齐 `EMBED_MODEL_TYPE=dashscope` 或 `local` + Qdrant + Neo4j + LLM，让语义记忆从「SQLite 关键词」逐层升级为「向量召回 + 图遍历召回 + LLM 抽取」全能力（代码已就绪，仅需配置）。
 5. **感知记忆（perceptual）**：`MyAgent/Memory/type/perceptual.py` 仍是空文件，若有多模态输入需求可补第四类记忆。
