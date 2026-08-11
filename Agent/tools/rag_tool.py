@@ -177,11 +177,18 @@ class RAGTool(Tool):
 
     def _search(self, query: str = None, limit: int = 5,
                 include_citations: bool = True,
-                namespace: Optional[str] = None, **kwargs) -> str:
+                namespace: Optional[str] = None,
+                enable_advanced: bool = True, **kwargs) -> str:
         if not query or not query.strip():
             return "❌ search 需要 query 参数"
         pipeline = self._get_pipeline(namespace)
-        results = pipeline["search"](query=query, top_k=limit)
+        # LLM 可用且启用高级检索 → MQE 多查询扩展 + HyDE 假设文档嵌入（对齐参考实现）
+        # 无 LLM 或关闭高级检索 → 基础向量检索
+        if enable_advanced and self.llm_client is not None:
+            results = pipeline["search_advanced"](
+                query=query, top_k=limit, enable_mqe=True, enable_hyde=True)
+        else:
+            results = pipeline["search"](query=query, top_k=limit)
         if not results:
             return f"🔍 未找到与 '{query}' 相关的内容"
         lines = [f"🔍 找到 {len(results)} 条相关片段:"]

@@ -269,10 +269,12 @@ ask(question):
   └─ [无 LLM ] search: 单 query 向量召回
   ──► 拼上下文(智能截断 max_chars) ──► [LLM 可用] complete() 生成自然语言答案 + 引用来源
                                        [无 LLM ] 降级返回检索到的原文片段(不编造)
-search(query) ──► 向量召回 ──► where 过滤(memory_type+rag_namespace) ──► score_threshold 后置 ──► 返回片段+相似度
+search(query) ──► [LLM 可用] search_advanced(MQE+HyDE) ──► [无 LLM] 基础向量召回
+              ──► where 过滤(memory_type+rag_namespace) ──► score_threshold 后置 ──► 返回片段+相似度
 clear(confirm=true) ──► 重建该 namespace 管道(内存库清空 / Qdrant 侧重建集合)
 ```
 
+> MQE（多查询扩展）与 HyDE（假设文档嵌入）均只在 LLM 可用时触发（走 `complete()`，失败回退原 query）；无 LLM 时 `search`/`ask` 退化为单 query 基础检索。`search` 动作带 `enable_advanced` 开关（默认 True）可关闭以换速度。
 > RAG 与 Memory 检索路由（参考第八章 §15）：涉及用户历史/偏好 → memory 工具；涉及外部文档/手册/知识库 → rag 工具；复杂助手常同时调用二者。
 
 ---

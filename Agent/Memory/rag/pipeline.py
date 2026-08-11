@@ -203,18 +203,47 @@ def _approx_token_len(text: str) -> int:
     return cjk + non_cjk
 
 
+# CommonMark ATX 标题：0-3 个前导空格 + 1-6 个 # + 空白 + 标题文本
+# （尾部可选的 #，如 `# H1 ###`）；7 个及以上 # 不算标题。
+_ATX_HEADING_RE = re.compile(r'^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$')
+# 代码围栏：``` 或 ~~~ 开头（3 个及以上），允许 0-3 个前导空格
+_FENCE_RE = re.compile(r'^\s{0,3}(`{3,}|~{3,})')
+
+
+def _parse_atx_heading(raw: str) -> Optional[tuple]:
+    """识别 CommonMark ATX 标题，返回 (level, title) 或 None。
+
+    要求 # 后跟空白、且行内有标题文本；`#include`、`#注释` 这类无空白
+    分隔的不匹配（避免把源码注释/预处理器指令当标题）。
+    """
+    m = _ATX_HEADING_RE.match(raw)
+    if not m:
+        return None
+    return len(m.group(1)), m.group(2).strip()
+
+
 def _split_paragraphs_with_headings(text: str) -> List[Dict]:
-    """按 markdown 标题层级切段落，保留 heading_path。"""
+    """按 markdown 标题层级切段落，保留 heading_path。
+
+    - 遵循 CommonMark ATX 标题语法（1-6 个 # 后跟空白），不再把
+      `#include` / `# 注释` / `#######` 这类误判成标题。
+    - 感知 ``` / ~~~ 代码围栏：围栏内的 # 不当标题，避免源码注释和
+      代码块被切碎。
+    - flush 后清空 buf，防止标题紧接正文（中间无空行）时旧内容
+      泄漏到下一节段落并重复发出。
+    """
     lines = text.splitlines()
     heading_stack: List[str] = []
     paragraphs: List[Dict] = []
     buf: List[str] = []
+    in_code_fence = False
     char_pos = 0
 
     def flush_buf(end_pos: int):
         if not buf:
             return
         content = "\n".join(buf).strip()
+        buf.clear()  # 清空，防止标题紧接正文时内容泄漏到下一节
         if not content:
             return
         paragraphs.append({
@@ -225,20 +254,25 @@ def _split_paragraphs_with_headings(text: str) -> List[Dict]:
         })
 
     for raw in lines:
-        if raw.strip().startswith("#"):
+        # 代码围栏开关：``` 或 ~~~ 开头即翻转状态（简化的 CommonMark 围栏）
+        if _FENCE_RE.match(raw):
+            in_code_fence = not in_code_fence
             flush_buf(char_pos)
-            level = len(raw) - len(raw.lstrip("#"))
-            title = raw.lstrip("#").strip()
-            if level <= 0:
-                level = 1
-            if level <= len(heading_stack):
-                heading_stack = heading_stack[: level - 1]
-            heading_stack.append(title)
             char_pos += len(raw) + 1
             continue
+        # 围栏内不识别标题，原样作为正文收集
+        if not in_code_fence:
+            heading = _parse_atx_heading(raw)
+            if heading is not None:
+                flush_buf(char_pos)
+                level, title = heading
+                if level <= len(heading_stack):
+                    heading_stack = heading_stack[: level - 1]
+                heading_stack.append(title)
+                char_pos += len(raw) + 1
+                continue
         if raw.strip() == "":
             flush_buf(char_pos)
-            buf = []
         else:
             buf.append(raw)
         char_pos += len(raw) + 1
