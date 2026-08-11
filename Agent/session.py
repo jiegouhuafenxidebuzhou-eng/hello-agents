@@ -5,6 +5,9 @@ WorkingMemory / MemoryManager / MemoryTool，身份 (user_id, session_id)
 在构造时烙入。LLMClient 是无状态 HTTP 客户端，全局共享，不重复建。
 
 不同会话 = 不同 Python 对象 → 物理隔离，无需过滤、无需加锁。
+
+情景记忆为可选启用（enable_episodic=True）：SQLite/Qdrant 虽全局共享单例，
+但所有读写都带 user_id 过滤，跨会话可召回长期记忆而互不串读。
 """
 
 from typing import Optional
@@ -12,6 +15,7 @@ from typing import Optional
 from Agent.LLMClient.llm_client import HelloAgentsLLM
 from Agent.LLMClient.my_agent import MyAgent
 from Agent.LLMClient.tool import Tool
+from Agent.Memory.episodic import EpisodicMemory
 from Agent.Memory.manager import MemoryManager
 from Agent.Memory.memory_tool import MemoryTool
 from Agent.Memory.working import WorkingMemory
@@ -21,7 +25,9 @@ def build_session_agent(llm_client: HelloAgentsLLM,
                         user_id: str,
                         session_id: str,
                         extra_tools: Optional[list] = None,
-                        max_steps: int = 10) -> MyAgent:
+                        max_steps: int = 10,
+                        enable_episodic: bool = False,
+                        episodic_db_path: Optional[str] = None) -> MyAgent:
     """为一个会话构造专属 Agent。
 
     Args:
@@ -29,10 +35,17 @@ def build_session_agent(llm_client: HelloAgentsLLM,
         user_id: 用户标识，服务端注入，LLM 不可指定。
         session_id: 会话标识，服务端注入，LLM 不可指定。
         extra_tools: 除记忆工具外，该会话还需要挂载的工具。
+        enable_episodic: 是否启用情景记忆（SQLite 权威层 + 可选 Qdrant 向量层）。
+        episodic_db_path: 情景记忆 SQLite 路径，None 用默认。
     """
     # 本会话专属的工作记忆，身份烙入
     working = WorkingMemory(user_id=user_id, session_id=session_id)
-    manager = MemoryManager(working=working, user_id=user_id, session_id=session_id)
+    # 情景记忆（可选）：身份烙入；SQLite/Qdrant 全局共享但读写带 user_id 过滤
+    episodic = (EpisodicMemory(user_id=user_id, session_id=session_id,
+                               db_path=episodic_db_path)
+                if enable_episodic else None)
+    manager = MemoryManager(working=working, episodic=episodic,
+                            user_id=user_id, session_id=session_id)
     mem_tool = MemoryTool(manager, user_id=user_id, session_id=session_id)
 
     tools = [mem_tool] + list(extra_tools or [])

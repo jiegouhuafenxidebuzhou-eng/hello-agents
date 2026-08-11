@@ -6,7 +6,7 @@
 - forget(memory_id) -> bool
 - stats() -> dict
 
-目前只接入了工作记忆；情景记忆、语义记忆后端留作插口（为 None 表示未启用），
+目前已接入工作记忆和情景记忆；语义记忆后端留作插口（为 None 表示未启用），
 后续实现同接口即可直接挂上，MemoryTool 无需改动。
 """
 
@@ -22,15 +22,22 @@ class MemoryManager:
                  episodic=None,
                  semantic=None,
                  user_id: str = "default",
-                 session_id: str = "default"):
+                 session_id: str = "default",
+                 enable_episodic: bool = False,
+                 episodic_db_path: Optional[str] = None):
         self.user_id = user_id
         self.session_id = session_id
         # 未显式提供 working 时，按本会话身份构造一个
         if working is None:
             working = WorkingMemory(user_id=user_id, session_id=session_id)
+        # 未显式提供 episodic 但显式开启时，按本会话身份构造一个
+        if episodic is None and enable_episodic:
+            from Agent.Memory.episodic import EpisodicMemory
+            episodic = EpisodicMemory(user_id=user_id, session_id=session_id,
+                                     db_path=episodic_db_path)
         self.backends: Dict[str, Any] = {
             "working": working,
-            "episodic": episodic,      # 暂未实现，留插口
+            "episodic": episodic,      # 默认 None 占位；enable_episodic=True 时自动构造
             "semantic": semantic,      # 暂未实现，留插口
         }
 
