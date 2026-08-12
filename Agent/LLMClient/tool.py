@@ -105,6 +105,18 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         print(f"✅ 工具 '{tool.name}' 已注册。")
 
+    def unregister(self, name: str) -> bool:
+        """按名称移除工具，不存在返回 False。"""
+        if name in self._tools:
+            del self._tools[name]
+            print(f"🗑️ 工具 '{name}' 已移除。")
+            return True
+        return False
+
+    def list_tools(self) -> List[str]:
+        """返回所有已注册工具的名称列表。"""
+        return list(self._tools.keys())
+
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)
 
