@@ -55,7 +55,7 @@ class QdrantStore:
 
     def __new__(cls, url: Optional[str] = None, api_key: Optional[str] = None,
                collection_name: str = "hello_agents_vectors",
-               vector_size: int = 384, distance: str = "cosine",
+               vector_size: int = 1024, distance: str = "cosine",
                timeout: int = 30):
         key = (url or "local", collection_name)
         if key not in cls._instances:
@@ -67,7 +67,7 @@ class QdrantStore:
 
     def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None,
                  collection_name: str = "hello_agents_vectors",
-                 vector_size: int = 384, distance: str = "cosine",
+                 vector_size: int = 1024, distance: str = "cosine",
                  timeout: int = 30):
         if hasattr(self, "_initialized"):
             return
@@ -163,12 +163,24 @@ class QdrantStore:
             if conds:
                 qfilter = Filter(must=conds)
         try:
-            hits = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector, query_filter=qfilter,
-                limit=limit, with_payload=True, with_vectors=False,
-            )
-            return [{"score": h.score, "payload": h.payload or {}} for h in hits]
+            # qdrant-client >= 1.10 移除了 .search，改用 .query_points；
+            # 兼容旧版本：有 query_points 用 query_points，否则回退 search。
+            if hasattr(self.client, "query_points"):
+                resp = self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=query_vector, query_filter=qfilter,
+                    limit=limit, with_payload=True, with_vectors=False,
+                )
+                points = resp.points if hasattr(resp, "points") else resp
+            else:
+                points = self.client.search(
+                    collection_name=self.collection_name,
+                    query_vector=query_vector, query_filter=qfilter,
+                    limit=limit, with_payload=True, with_vectors=False,
+                )
+            return [{"score": getattr(h, "score", 0.0),
+                     "payload": (h.payload if hasattr(h, "payload") else (h.get("payload") or {}))}
+                    for h in points]
         except Exception as e:
             logger.warning(f"Qdrant search 失败: {e}")
             return []
